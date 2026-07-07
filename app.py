@@ -1,296 +1,181 @@
-from flask import Flask, request, jsonify
 import asyncio
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
-import binascii
-import aiohttp
-import requests
+import time
+import httpx
 import json
-import like_pb2
-import like_count_pb2
-import uid_generator_pb2
-import threading
-import urllib3
-import random
+from collections import defaultdict
+from functools import wraps
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from cachetools import TTLCache
+from typing import Tuple
+from proto import FreeFire_pb2, main_pb2, AccountPersonalShow_pb2
+from google.protobuf import json_format, message
+from google.protobuf.message import Message
+from Crypto.Cipher import AES
+import base64
 
-# Configuration
-TOKEN_BATCH_SIZE = 189
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# === Settings ===
 
-# Global State for Batch Management
-current_batch_indices = {}
-batch_indices_lock = threading.Lock()
+MAIN_KEY = base64.b64decode('WWcmdGMlREV1aDYlWmNeOA==')
+MAIN_IV = base64.b64decode('Nm95WkRyMjJFM3ljaGpNJQ==')
+RELEASEVERSION = "OB52"
+USERAGENT = "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)"
+SUPPORTED_REGIONS = {"IND", "BR", "US", "SAC", "NA", "SG", "RU", "ID", "TW", "VN", "TH", "ME", "PK", "CIS", "BD", "EUROPE"}
 
-def get_next_batch_tokens(server_name, all_tokens):
-    if not all_tokens:
-        return[]
-    
-    total_tokens = len(all_tokens)
-    if total_tokens <= TOKEN_BATCH_SIZE:
-        return all_tokens
-    
-    with batch_indices_lock:
-        if server_name not in current_batch_indices:
-            current_batch_indices[server_name] = 0
-        
-        current_index = current_batch_indices[server_name]
-        start_index = current_index
-        end_index = start_index + TOKEN_BATCH_SIZE
-        
-        if end_index > total_tokens:
-            remaining = end_index - total_tokens
-            batch_tokens = all_tokens[start_index:total_tokens] + all_tokens[0:remaining]
-        else:
-            batch_tokens = all_tokens[start_index:end_index]
-        
-        next_index = (current_index + TOKEN_BATCH_SIZE) % total_tokens
-        current_batch_indices[server_name] = next_index
-        return batch_tokens
-
-def get_random_batch_tokens(server_name, all_tokens):
-    if not all_tokens:
-        return[]
-    total_tokens = len(all_tokens)
-    if total_tokens <= TOKEN_BATCH_SIZE:
-        return all_tokens.copy()
-    return random.sample(all_tokens, TOKEN_BATCH_SIZE)
-
-def load_tokens(server_name, for_visit=False):
-    server_name = server_name.upper()
-    
-    if for_visit:
-        if server_name == "IND":
-            path = "token_ind_visit.json"
-        elif server_name in {"BR", "US", "SAC", "NA"}:
-            path = "token_br_visit.json"
-        elif server_name == "BD":
-            path = "token_bd_visit.json"
-        elif server_name == "ME":
-            path = "token_me_visit.json"
-        else:
-            path = f"token_{server_name.lower()}_visit.json"
-    else:
-        if server_name == "IND":
-            path = "token_ind.json"
-        elif server_name in {"BR", "US", "SAC", "NA"}:
-            path = "token_br.json"
-        elif server_name == "BD":
-            path = "token_bd.json"
-        elif server_name == "ME":
-            path = "token_me.json"
-        else:
-            path = f"token_{server_name.lower()}.json"
-
-    try:
-        with open(path, "r") as f:
-            tokens = json.load(f)
-            if isinstance(tokens, list) and all(isinstance(t, dict) and "token" in t for t in tokens):
-                print(f"Loaded {len(tokens)} tokens from {path} for server {server_name}")
-                return tokens
-            else:
-                print(f"Warning: Token file {path} is not in the expected format. Returning empty list.")
-                return[]
-    except FileNotFoundError:
-        print(f"Warning: Token file {path} not found. Returning empty list for server {server_name}.")
-        return[]
-    except json.JSONDecodeError:
-        print(f"Warning: Token file {path} contains invalid JSON. Returning empty list.")
-        return[]
-
-def encrypt_message(plaintext):
-    key = b'Yg&tc%DEuh6%Zc^8'
-    iv = b'6oyZDr22E3ychjM%'
-    cipher = AES.new(key, AES.MODE_CBC, iv)
-    padded_message = pad(plaintext, AES.block_size)
-    encrypted_message = cipher.encrypt(padded_message)
-    return binascii.hexlify(encrypted_message).decode('utf-8')
-
-def create_protobuf_message(user_id, region):
-    message = like_pb2.like()
-    message.uid = int(user_id)
-    message.region = region
-    return message.SerializeToString()
-
-def create_protobuf_for_profile_check(uid):
-    message = uid_generator_pb2.uid_generator()
-    message.krishna_ = int(uid)
-    message.teamXdarks = 1
-    return message.SerializeToString()
-
-def enc_profile_check_payload(uid):
-    protobuf_data = create_protobuf_for_profile_check(uid)
-    encrypted_uid = encrypt_message(protobuf_data)
-    return encrypted_uid
-
-async def send_single_like_request(encrypted_like_payload, token_dict, url):
-    edata = bytes.fromhex(encrypted_like_payload)
-    token_value = token_dict.get("token", "")
-    if not token_value:
-        return 999
-
-    headers = {
-        'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-        'Connection': "Keep-Alive",
-        'Accept-Encoding': "gzip",
-        'Authorization': f"Bearer {token_value}",
-        'Content-Type': "application/x-www-form-urlencoded",
-        'Expect': "100-continue",
-        'X-Unity-Version': "2018.4.11f1",
-        'X-GA': "v1 1",
-        'ReleaseVersion': "OB51"
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, data=edata, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                return response.status
-    except asyncio.TimeoutError:
-        return 998
-    except Exception:
-        return 997
-
-async def send_likes_with_token_batch(uid, server_region_for_like_proto, like_api_url, token_batch_to_use):
-    if not token_batch_to_use:
-        return[]
-
-    like_protobuf_payload = create_protobuf_message(uid, server_region_for_like_proto)
-    encrypted_like_payload = encrypt_message(like_protobuf_payload)
-    
-    tasks =[]
-    for token_dict_for_request in token_batch_to_use:
-        tasks.append(send_single_like_request(encrypted_like_payload, token_dict_for_request, like_api_url))
-    
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    return results
-
-def make_profile_check_request(encrypted_profile_payload, server_name, token_dict):
-    token_value = token_dict.get("token", "")
-    if not token_value:
-        return None
-
-    if server_name == "IND":
-        url = "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
-    elif server_name in {"BR", "US", "SAC", "NA"}:
-        url = "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
-    else:
-        url = "https://clientbp.ggblueshark.com/GetPlayerPersonalShow"
-
-    edata = bytes.fromhex(encrypted_profile_payload)
-    headers = {
-        'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-        'Connection': "Keep-Alive",
-        'Accept-Encoding': "gzip",
-        'Authorization': f"Bearer {token_value}",
-        'Content-Type': "application/x-www-form-urlencoded",
-        'Expect': "100-continue",
-        'X-Unity-Version': "2018.4.11f1",
-        'X-GA': "v1 1",
-        'ReleaseVersion': "OB51"
-    }
-    try:
-        response = requests.post(url, data=edata, headers=headers, verify=False, timeout=10)
-        response.raise_for_status()
-        binary_data = response.content
-        return decode_protobuf_profile_info(binary_data)
-    except Exception:
-        return None
-
-def decode_protobuf_profile_info(binary_data):
-    try:
-        items = like_count_pb2.Info()
-        items.ParseFromString(binary_data)
-        return items
-    except Exception:
-        return None
+# === Flask App Setup ===
 
 app = Flask(__name__)
+CORS(app)
+cache = TTLCache(maxsize=100, ttl=300)
+cached_tokens = defaultdict(dict)
+uid_region_cache = {}
 
-@app.route('/like', methods=['GET'])
-def handle_requests():
-    uid_param = request.args.get("uid")
-    server_name_param = request.args.get("server_name", "").upper()
-    use_random = request.args.get("random", "false").lower() == "true"
+# === Helper Functions ===
 
-    if not uid_param or not server_name_param:
-        return jsonify({"error": "UID and server_name are required"}), 400
+def pad(text: bytes) -> bytes:
+    padding_length = AES.block_size - (len(text) % AES.block_size)
+    return text + bytes([padding_length] * padding_length)
 
-    visit_tokens = load_tokens(server_name_param, for_visit=True)
-    if not visit_tokens:
-        return jsonify({"error": f"No visit tokens loaded for server {server_name_param}."}), 500
-    
-    visit_token = visit_tokens[0] if visit_tokens else None
-    
-    all_available_tokens = load_tokens(server_name_param, for_visit=False)
-    if not all_available_tokens:
-        return jsonify({"error": f"No tokens loaded or token file invalid for server {server_name_param}."}), 500
+def aes_cbc_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
+    aes = AES.new(key, AES.MODE_CBC, iv)
+    return aes.encrypt(pad(plaintext))
 
-    if use_random:
-        tokens_for_like_sending = get_random_batch_tokens(server_name_param, all_available_tokens)
+def decode_protobuf(encoded_data: bytes, message_type: message.Message) -> message.Message:
+    instance = message_type()
+    instance.ParseFromString(encoded_data)
+    return instance
+
+async def json_to_proto(json_data: str, proto_message: Message) -> bytes:
+    json_format.ParseDict(json.loads(json_data), proto_message)
+    return proto_message.SerializeToString()
+
+def get_account_credentials(region: str) -> str:
+    r = region.upper()
+    if r == "IND":
+        return "uid=3933356115&password=CA6DDAEE7F32A95D6BC17B15B8D5C59E091338B4609F25A1728720E8E4C107C4"
+    elif r in {"BR", "US", "SAC", "NA"}:
+        return "uid=4044223479&password=EB067625F1E2CB705C7561747A46D502480DC5D41497F4C90F3FDBC73B8082ED"
     else:
-        tokens_for_like_sending = get_next_batch_tokens(server_name_param, all_available_tokens)
-    
-    encrypted_player_uid_for_profile = enc_profile_check_payload(uid_param)
-    
-    before_info = make_profile_check_request(encrypted_player_uid_for_profile, server_name_param, visit_token)
-    before_like_count = 0
-    
-    if before_info and hasattr(before_info, 'AccountInfo'):
-        before_like_count = int(before_info.AccountInfo.Likes)
+        return "uid=4108414251&password=E4F9C33BBEB23C0DA0AD7E60F63C8A05D6A878798E3CD32C4E2314C1EEFD4F72"
 
-    if server_name_param == "IND":
-        like_api_url = "https://client.ind.freefiremobile.com/LikeProfile"
-    elif server_name_param in {"BR", "US", "SAC", "NA"}:
-        like_api_url = "https://client.us.freefiremobile.com/LikeProfile"
-    else:
-        like_api_url = "https://clientbp.ggblueshark.com/LikeProfile"
+# === Token Generation ===
 
-    if tokens_for_like_sending:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(send_likes_with_token_batch(uid_param, server_name_param, like_api_url, tokens_for_like_sending))
-        finally:
-            loop.close()
-        
-    after_info = make_profile_check_request(encrypted_player_uid_for_profile, server_name_param, visit_token)
-    after_like_count = before_like_count
-    actual_player_uid_from_profile = int(uid_param)
-    player_nickname_from_profile = "N/A"
+async def get_access_token(account: str):
+    url = "https://ffmconnect.live.gop.garenanow.com/oauth/guest/token/grant"
+    payload = account + "&response_type=token&client_type=2&client_secret=2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3&client_id=100067"
+    headers = {'User-Agent': USERAGENT, 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip", 'Content-Type': "application/x-www-form-urlencoded"}
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, data=payload, headers=headers)
+        data = resp.json()
+        return data.get("access_token", "0"), data.get("open_id", "0")
 
-    if after_info and hasattr(after_info, 'AccountInfo'):
-        after_like_count = int(after_info.AccountInfo.Likes)
-        actual_player_uid_from_profile = int(after_info.AccountInfo.UID)
-        if after_info.AccountInfo.PlayerNickname:
-            player_nickname_from_profile = str(after_info.AccountInfo.PlayerNickname)
-
-    likes_increment = after_like_count - before_like_count
-    request_status = 1 if likes_increment > 0 else (2 if likes_increment == 0 else 3)
-
-    response_data = {
-        "LikesGivenByAPI": likes_increment,
-        "LikesafterCommand": after_like_count,
-        "LikesbeforeCommand": before_like_count,
-        "PlayerNickname": player_nickname_from_profile,
-        "UID": actual_player_uid_from_profile,
-        "status": request_status,
-        "Note": f"Used visit token for profile check and {'random' if use_random else 'rotating'} batch of {len(tokens_for_like_sending)} tokens for like sending."
-    }
-    return jsonify(response_data)
-
-@app.route('/token_info', methods=['GET'])
-def token_info():
-    """Endpoint to check token counts for each server"""
-    servers =["IND", "BD", "BR", "US", "SAC", "NA", "ME"]
-    info = {}
-    
-    for server in servers:
-        regular_tokens = load_tokens(server, for_visit=False)
-        visit_tokens = load_tokens(server, for_visit=True)
-        info[server] = {
-            "regular_tokens": len(regular_tokens),
-            "visit_tokens": len(visit_tokens)
+async def create_jwt(region: str):
+    account = get_account_credentials(region)
+    token_val, open_id = await get_access_token(account)
+    body = json.dumps({"open_id": open_id, "open_id_type": "4", "login_token": token_val, "orign_platform_type": "4"})
+    proto_bytes = await json_to_proto(body, FreeFire_pb2.LoginReq())
+    payload = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, proto_bytes)
+    url = "https://loginbp.ggblueshark.com/MajorLogin"
+    headers = {'User-Agent': USERAGENT, 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip",
+               'Content-Type': "application/octet-stream", 'Expect': "100-continue", 'X-Unity-Version': "2018.4.11f1",
+               'X-GA': "v1 1", 'ReleaseVersion': RELEASEVERSION}
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, data=payload, headers=headers)
+        msg = json.loads(json_format.MessageToJson(decode_protobuf(resp.content, FreeFire_pb2.LoginRes)))
+        cached_tokens[region] = {
+            'token': f"Bearer {msg.get('token','0')}",
+            'region': msg.get('lockRegion','0'),
+            'server_url': msg.get('serverUrl','0'),
+            'expires_at': time.time() + 25200
         }
-    
-    return jsonify(info)
+
+async def initialize_tokens():
+    tasks = [create_jwt(r) for r in SUPPORTED_REGIONS]
+    await asyncio.gather(*tasks)
+
+async def refresh_tokens_periodically():
+    while True:
+        await asyncio.sleep(25200)
+        await initialize_tokens()
+
+async def get_token_info(region: str) -> Tuple[str,str,str]:
+    info = cached_tokens.get(region)
+    if info and time.time() < info['expires_at']:
+        return info['token'], info['region'], info['server_url']
+    await create_jwt(region)
+    info = cached_tokens[region]
+    return info['token'], info['region'], info['server_url']
+
+async def GetAccountInformation(uid, unk, region, endpoint):
+    payload = await json_to_proto(json.dumps({'a': uid, 'b': unk}), main_pb2.GetPlayerPersonalShow())
+    data_enc = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, payload)
+    token, lock, server = await get_token_info(region)
+    headers = {'User-Agent': USERAGENT, 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip",
+               'Content-Type': "application/octet-stream", 'Expect': "100-continue",
+               'Authorization': token, 'X-Unity-Version': "2018.4.11f1", 'X-GA': "v1 1",
+               'ReleaseVersion': RELEASEVERSION}
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(server+endpoint, data=data_enc, headers=headers)
+        return json.loads(json_format.MessageToJson(decode_protobuf(resp.content, AccountPersonalShow_pb2.AccountPersonalShowInfo)))
+
+# === Caching Decorator ===
+
+def cached_endpoint(ttl=300):
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*a, **k):
+            key = (request.path, tuple(request.args.items()))
+            if key in cache:
+                return cache[key]
+            res = fn(*a, **k)
+            cache[key] = res
+            return res
+        return wrapper
+    return decorator
+
+# === Flask Routes ===
+
+@app.route('/player-info')
+@cached_endpoint()
+def get_account_info():
+    uid = request.args.get('uid')
+    if not uid:
+        return jsonify({"error": "Please provide UID."}), 400
+
+    # Check cached region for UID
+    if uid in uid_region_cache:
+        try:
+            return_data = asyncio.run(GetAccountInformation(uid, "7", uid_region_cache[uid], "/GetPlayerPersonalShow"))
+            formatted_json = json.dumps(return_data, indent=2, ensure_ascii=False)
+            return formatted_json, 200, {'Content-Type': 'application/json; charset=utf-8'}
+        except:
+            pass  # fallback to testing all regions
+
+    for region in SUPPORTED_REGIONS:
+        try:
+            return_data = asyncio.run(GetAccountInformation(uid, "7", region, "/GetPlayerPersonalShow"))
+            uid_region_cache[uid] = region
+            formatted_json = json.dumps(return_data, indent=2, ensure_ascii=False)
+            return formatted_json, 200, {'Content-Type': 'application/json; charset=utf-8'}
+        except:
+            continue
+
+    return jsonify({"error": "UID not found in any region."}), 404
+
+@app.route('/refresh', methods=['GET','POST'])
+def refresh_tokens_endpoint():
+    try:
+        asyncio.run(initialize_tokens())
+        return jsonify({'message':'Tokens refreshed for all regions.'}),200
+    except Exception as e:
+        return jsonify({'error': f'Refresh failed: {e}'}),500
+
+# === Startup ===
+
+async def startup():
+    await initialize_tokens()
+    asyncio.create_task(refresh_tokens_periodically())
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001, debug=True, use_reloader=False)
+    asyncio.run(startup())
+    app.run(host='0.0.0.0', port=5000, debug=True)
